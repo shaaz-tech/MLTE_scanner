@@ -40,7 +40,7 @@ CONFIG = {
 }
 
 NSE_INTERVAL = "15m"      # yfinance intraday interval
-CRYPTO_INTERVAL = "15m"   # Binance kline interval
+CRYPTO_INTERVAL = "15m"   # Kraken kline interval
 CRYPTO_TOP_N = 200        # top coins by market cap to include
 CRYPTO_MAX_MEME = 150     # cap on meme-token category coins
 
@@ -76,11 +76,11 @@ def scan_nse() -> list[dict]:
 def scan_crypto() -> list[dict]:
     logger.info("Starting crypto scan...")
     coin_symbols = ds.get_crypto_universe(top_n=CRYPTO_TOP_N, max_meme_coins=CRYPTO_MAX_MEME)
-    pairs = ds.match_to_binance_usdt_pairs(coin_symbols)
+    pairs = ds.match_to_kraken_usd_pairs(coin_symbols)
 
     matches = []
     for pair in pairs:
-        df = ds.get_binance_candles(pair, interval=CRYPTO_INTERVAL)
+        df = ds.get_kraken_candles(pair, interval=CRYPTO_INTERVAL)
         if df is None:
             continue
         try:
