@@ -3,7 +3,7 @@ data_sources.py
 ----------------
 Fetches the FULL NSE equity list and candle data (via yfinance, free, no
 broker account needed) plus a broad crypto universe (top market-cap coins +
-the full CoinGecko "meme-token" category, matched to Binance USDT pairs for
+the full CoinGecko "meme-token" category, matched to Kraken USD pairs for
 free candle data).
 
 Honest limitations, stated up front:
@@ -13,10 +13,13 @@ Honest limitations, stated up front:
     credentials -- that's a straightforward swap-in later if you need it,
     but it requires a broker account + API subscription, which is why this
     starts with the free/no-account option.
-  - Meme coins that aren't listed on Binance are skipped for candle data
-    (logged, not silently dropped) since Binance's public API is free and
-    reliable; CoinGecko's own OHLC endpoint could be added as a fallback
-    for those if you want full coverage of very new/small meme coins later.
+  - Meme coins that aren't listed on Kraken are skipped for candle data
+    (logged, not silently dropped). Kraken is used instead of Binance
+    because Binance.com geo-blocks requests from US-hosted servers
+    (including GitHub Actions runners) with an HTTP 451 error -- Kraken,
+    being US-domiciled, does not. Kraken has somewhat fewer meme-coin
+    listings than Binance; CoinGecko's own OHLC endpoint could be added as
+    a further fallback for coins on neither exchange if needed later.
 """
 
 from __future__ import annotations
@@ -36,8 +39,10 @@ NSE_CSV_URL_FALLBACK = "https://archives.nseindia.com/content/equities/EQUITY_L.
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 COINGECKO_MEME_CATEGORY = "meme-token"
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_ASSET_PAIRS_URL = "https://api.kraken.com/0/public/AssetPairs"
+KRAKEN_INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+KRAKEN_SYMBOL_ALIASES = {"BTC": "XBT"}  # Kraken calls Bitcoin "XBT", not "BTC"
 
 
 # ============================================================================
@@ -106,7 +111,7 @@ def get_nse_candles_batch(symbols: list[str], interval: str = "15m", period: str
 
 
 # ============================================================================
-# CRYPTO — top market cap + full meme-token category, matched to Binance
+# CRYPTO — top market cap + full meme-token category, matched to Kraken
 # ============================================================================
 def get_crypto_universe(top_n: int = 200, include_meme_category: bool = True,
                           max_meme_coins: int = 150) -> list[str]:
@@ -140,55 +145,75 @@ def get_crypto_universe(top_n: int = 200, include_meme_category: bool = True,
         except requests.RequestException as e:
             logger.warning(f"CoinGecko meme-token category fetch failed: {e}")
 
-    logger.info(f"Crypto universe: {len(symbols)} unique symbols before Binance matching")
+    logger.info(f"Crypto universe: {len(symbols)} unique symbols before Kraken matching")
     return sorted(symbols)
 
 
-def match_to_binance_usdt_pairs(coin_symbols: list[str]) -> list[str]:
-    """Filters coin symbols down to ones that actually have a USDT pair on
-    Binance (needed for free candle data). Returns e.g. ['BTCUSDT', 'DOGEUSDT']."""
+def match_to_kraken_usd_pairs(coin_symbols: list[str]) -> list[str]:
+    """Filters coin symbols down to ones that actually have a USD pair on
+    Kraken (needed for free candle data). Kraken is a US-domiciled exchange
+    and its public market-data API is NOT geo-blocked for US-hosted servers
+    the way Binance.com's is (Binance returns HTTP 451 to US server IPs,
+    including GitHub Actions runners -- that's why Kraken is used here
+    instead). Returns Kraken altnames, e.g. ['XBTUSD', 'DOGEUSD']."""
     try:
-        resp = requests.get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
+        resp = requests.get(KRAKEN_ASSET_PAIRS_URL, timeout=15)
         resp.raise_for_status()
-        listed = {s["symbol"] for s in resp.json()["symbols"] if s["quoteAsset"] == "USDT"}
+        data = resp.json()
+        if data.get("error"):
+            logger.warning(f"Kraken AssetPairs returned errors: {data['error']}")
+        altnames = {info["altname"].upper() for info in data.get("result", {}).values()}
     except requests.RequestException as e:
-        logger.warning(f"Binance exchangeInfo fetch failed: {e}")
+        logger.warning(f"Kraken AssetPairs fetch failed: {e}")
         return []
 
     matched, skipped = [], []
     for sym in coin_symbols:
-        pair = f"{sym}USDT"
-        if pair in listed:
-            matched.append(pair)
+        kraken_sym = KRAKEN_SYMBOL_ALIASES.get(sym, sym)
+        candidate = f"{kraken_sym}USD"
+        if candidate in altnames:
+            matched.append(candidate)
         else:
             skipped.append(sym)
 
     if skipped:
-        logger.info(f"{len(skipped)} coins have no Binance USDT pair, skipped: {skipped[:20]}{'...' if len(skipped) > 20 else ''}")
-    logger.info(f"{len(matched)} coins matched to Binance USDT pairs")
+        logger.info(f"{len(skipped)} coins have no Kraken USD pair, skipped: {skipped[:20]}{'...' if len(skipped) > 20 else ''}")
+    logger.info(f"{len(matched)} coins matched to Kraken USD pairs")
     return matched
 
 
-def get_binance_candles(pair: str, interval: str = "15m", limit: int = 200):
-    """Fetches candles for one Binance pair. interval examples: 1m, 5m, 15m, 1h, 1d."""
+def get_kraken_candles(pair: str, interval: str = "15m", limit: int = 200) -> pd.DataFrame | None:
+    """Fetches candles for one Kraken pair (altname, e.g. 'XBTUSD'). interval
+    examples: 1m, 5m, 15m, 30m, 1h, 4h, 1d. Kraken returns up to 720 of the
+    most recent candles regardless of limit; we trim to `limit` afterward."""
+    minutes = KRAKEN_INTERVAL_MINUTES.get(interval, 15)
     try:
-        resp = requests.get(BINANCE_KLINES_URL, params={
-            "symbol": pair, "interval": interval, "limit": limit,
+        resp = requests.get(KRAKEN_OHLC_URL, params={
+            "pair": pair, "interval": minutes,
         }, timeout=10)
         resp.raise_for_status()
-        raw = resp.json()
+        data = resp.json()
     except requests.RequestException as e:
-        logger.warning(f"Binance klines fetch failed for {pair}: {e}")
+        logger.warning(f"Kraken OHLC fetch failed for {pair}: {e}")
         return None
 
-    if not raw:
+    if data.get("error"):
+        logger.warning(f"Kraken OHLC returned errors for {pair}: {data['error']}")
         return None
 
+    result = data.get("result", {})
+    # The result key isn't always the altname we queried with (Kraken often
+    # returns its internal name, e.g. 'XXBTZUSD' for 'XBTUSD') -- grab
+    # whichever key isn't 'last'.
+    series_key = next((k for k in result.keys() if k != "last"), None)
+    if series_key is None or not result[series_key]:
+        return None
+
+    raw = result[series_key][-limit:]
     df = pd.DataFrame(raw, columns=[
-        "OpenTime", "Open", "High", "Low", "Close", "Volume", "CloseTime",
-        "QuoteVol", "Trades", "TakerBase", "TakerQuote", "Ignore",
+        "Time", "Open", "High", "Low", "Close", "VWAP", "Volume", "Count",
     ])
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[col] = df[col].astype(float)
-    df.index = pd.to_datetime(df["OpenTime"], unit="ms")
+    df.index = pd.to_datetime(df["Time"], unit="s")
     return df[["Open", "High", "Low", "Close", "Volume"]]
