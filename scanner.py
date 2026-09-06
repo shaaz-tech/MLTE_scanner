@@ -43,6 +43,7 @@ NSE_INTERVAL = "15m"      # yfinance intraday interval
 CRYPTO_INTERVAL = "15m"   # Kraken kline interval
 CRYPTO_TOP_N = 200        # top coins by market cap to include
 CRYPTO_MAX_MEME = 150     # cap on meme-token category coins
+MIN_RVOL_ALERT = 4.0      # only notify for matches with RVOL >= this value
 
 
 def is_nse_market_hours() -> bool:
@@ -69,7 +70,8 @@ def scan_nse() -> list[dict]:
         if result.get("match_long") or result.get("match_short"):
             matches.append({"symbol": symbol, **result})
 
-    logger.info(f"NSE scan complete: {len(matches)} matches out of {len(candles)} scanned")
+    matches = [m for m in matches if m["rvol"] >= MIN_RVOL_ALERT]
+    logger.info(f"NSE scan complete: {len(matches)} matches (RVOL >= {MIN_RVOL_ALERT}x) out of {len(candles)} scanned")
     return matches
 
 
@@ -91,7 +93,8 @@ def scan_crypto() -> list[dict]:
         if result.get("match_long") or result.get("match_short"):
             matches.append({"symbol": pair, **result})
 
-    logger.info(f"Crypto scan complete: {len(matches)} matches out of {len(pairs)} scanned")
+    matches = [m for m in matches if m["rvol"] >= MIN_RVOL_ALERT]
+    logger.info(f"Crypto scan complete: {len(matches)} matches (RVOL >= {MIN_RVOL_ALERT}x) out of {len(pairs)} scanned")
     return matches
 
 
